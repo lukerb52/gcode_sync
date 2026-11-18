@@ -1,0 +1,502 @@
+#!/bin/sh
+""":"
+# Also safe when launched explicitly with sh: never interpret Python imports.
+exec python3 "$0" "$@"
+":"""
+
+DESCRIPTION = "Configure and sync printer cards on Linux using stable filesystem UUIDs."
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+class SyncError(Exception):
+    pass
+
+
+def run(args, **kwargs):
+    try:
+        return subprocess.run(args, check=True, **kwargs)
+    except FileNotFoundError as exc:
+        raise SyncError(f"Required command not found: {args[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise SyncError(f"Command failed ({exc.returncode}): {' '.join(map(str, args))}") from exc
+
+
+def config_path():
+    base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    return base / "gcode_sync" / "config.json"
+
+
+def valid_id(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]*", value) is not None
+
+
+def valid_uuid(value):
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9-]+", value) is not None
+
+
+def validate_config(data):
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise SyncError("Unsupported configuration version (expected version 1).")
+    printers, cards = data.get("printers"), data.get("cards")
+    if not isinstance(printers, dict) or not isinstance(cards, dict):
+        raise SyncError("Configuration must contain printers and cards objects.")
+    for key, printer in printers.items():
+        if not valid_id(key) or not isinstance(printer, dict):
+            raise SyncError("Invalid printer profile.")
+        if not isinstance(printer.get("name"), str) or not printer["name"].strip():
+            raise SyncError(f"Printer {key} needs a name.")
+        source = printer.get("source")
+        if not isinstance(source, str) or not Path(source).is_absolute() or "\n" in source:
+            raise SyncError(f"Printer {key} needs an absolute source directory.")
+        filename = printer.get("config_file", "")
+        if not isinstance(filename, str) or filename in (".", "..") or "/" in filename or "\n" in filename:
+            raise SyncError(f"Invalid configuration filename for {key}.")
+    uuids, mounts = set(), set()
+    for key, card in cards.items():
+        if not valid_id(key) or not isinstance(card, dict):
+            raise SyncError("Invalid card profile.")
+        uuid, mount = card.get("uuid"), card.get("mount")
+        if card.get("printer") not in printers or not valid_uuid(uuid):
+            raise SyncError(f"Invalid printer or UUID for card {key}.")
+        if not isinstance(mount, str) or mount != f"/mnt/gcode_sync/{key}":
+            raise SyncError(f"Invalid mount point for card {key}.")
+        if uuid.lower() in uuids or mount in mounts:
+            raise SyncError("A card UUID or mount point is assigned more than once.")
+        previous_bin = card.get("last_bin")
+        if previous_bin is not None and (not isinstance(previous_bin, str) or not re.fullmatch(r"F[0-9]{7}\.BIN", previous_bin)):
+            raise SyncError(f"Invalid tracked firmware filename for {key}.")
+        uuids.add(uuid.lower())
+        mounts.add(mount)
+    return data
+
+
+def load_config(path):
+    if not path.exists():
+        return {"version": 1, "printers": {}, "cards": {}}
+    try:
+        return validate_config(json.loads(path.read_text()))
+    except (OSError, ValueError) as exc:
+        raise SyncError(f"Cannot read configuration {path}: {exc}") from exc
+
+
+def save_config(path, data):
+    validate_config(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".config-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def prompt(label, default=None):
+    suffix = f" [{default}]" if default is not None else ""
+    answer = input(f"{label}{suffix}: ").strip()
+    return answer or (default if default is not None else "")
+
+
+def confirm(label):
+    return prompt(label + " [y/N]").lower() in ("y", "yes")
+
+
+def choose_id(label, entries):
+    for key, entry in entries.items():
+        print(f"  {key}: {entry.get('name', entry.get('printer', ''))}")
+    value = prompt(label)
+    if value not in entries:
+        raise SyncError(f"Unknown selection: {value}")
+    return value
+
+
+def add_printer(data, path, key=None):
+    editing = key is not None
+    if editing and key not in data["printers"]:
+        raise SyncError(f"Unknown printer: {key}")
+    key = key or prompt("Printer ID (lowercase letters, numbers, - or _, e.g. ender3)")
+    if not valid_id(key) or (not editing and key in data["printers"]):
+        raise SyncError("Printer ID is invalid or already exists.")
+    previous = data["printers"].get(key, {})
+    name = prompt("Printer display name", previous.get("name", key))
+    print("Choose the directory whose CONTENTS should go on this printer's cards.")
+    print("Use a separate folder per printer; spaces and ~ are supported. Do not add shell quotes.")
+    while True:
+        entered = prompt("G-code folder (existing directory, not a .gcode file)", previous.get("source"))
+        if not entered:
+            print("A folder path is required; an empty answer does not select the current directory.")
+            continue
+        source = Path(entered).expanduser().resolve()
+        if source.is_dir():
+            break
+        print(f"Not an existing directory: {source}. Enter the folder containing your G-code files.")
+    if not confirm(f"Use {source} for {name}?"):
+        raise SyncError("Cancelled; no printer saved.")
+    filename = prompt("Optional root filename to copy FROM the card before syncing (Enter for none)")
+    data["printers"][key] = {"name": name, "source": str(source), "config_file": filename}
+    save_config(path, data)
+    print(f"Saved printer {key}.")
+    return key
+
+
+def devices():
+    result = run(["lsblk", "--json", "--paths", "--output",
+                  "NAME,TYPE,SIZE,FSTYPE,UUID,LABEL,RM,MOUNTPOINT"], capture_output=True, text=True)
+    found = []
+
+    def visit(nodes, removable=False):
+        for node in nodes:
+            removable_here = removable or bool(node.get("rm"))
+            if node.get("uuid") and node.get("fstype") and node.get("type") in ("part", "disk"):
+                found.append(dict(node, removable=removable_here))
+            visit(node.get("children", []), removable_here)
+
+    visit(json.loads(result.stdout).get("blockdevices", []))
+    return found
+
+
+FILESYSTEMS = {"vfat", "exfat", "ext2", "ext3", "ext4", "ntfs", "ntfs3"}
+
+
+def fstab_line(card, filesystem):
+    if filesystem not in FILESYSTEMS:
+        raise SyncError(f"Unsupported card filesystem: {filesystem}")
+    options = "noauto,users,nofail,rw"
+    if filesystem in {"vfat", "exfat", "ntfs", "ntfs3"}:
+        options += f",uid={os.getuid()},gid={os.getgid()},umask=022"
+    return f"UUID={card['uuid']} {card['mount']} {filesystem} {options} 0 0"
+
+
+def check_fstab(text, line):
+    """Return True for our exact entry; reject conflicting UUIDs/mounts."""
+    wanted = line.split()
+    exact = False
+    for raw in text.splitlines():
+        fields = raw.split("#", 1)[0].split()
+        if len(fields) >= 2 and (fields[0].lower() == wanted[0].lower() or fields[1] == wanted[1]):
+            if fields != wanted or exact:
+                raise SyncError("Conflicting /etc/fstab entry; resolve it manually before continuing.")
+            exact = True
+    return exact
+
+
+# Run only this small helper with elevated privileges; syncing never runs as root.
+FSTAB_HELPER = r'''
+import fcntl, json, os, pathlib, shutil, sys, tempfile, time
+line = json.load(sys.stdin)["line"]
+fields = line.split()
+import re
+if (len(fields) != 6 or line != " ".join(fields)
+    or not re.fullmatch(r"UUID=[A-Za-z0-9-]+", fields[0])
+    or not re.fullmatch(r"/mnt/gcode_sync/[a-z0-9][a-z0-9_-]*", fields[1])
+    or fields[2] not in {"vfat", "exfat", "ext2", "ext3", "ext4", "ntfs", "ntfs3"}
+    or not re.fullmatch(r"noauto,users,nofail,rw(?:,uid=\d+,gid=\d+,umask=022)?", fields[3])
+    or fields[4:] != ["0", "0"]):
+    sys.exit("Invalid fstab request")
+with open("/etc/.gcode_sync-fstab.lock", "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    path = pathlib.Path("/etc/fstab")
+    text = path.read_text()
+    exists = False
+    for raw in text.splitlines():
+        current = raw.split("#", 1)[0].split()
+        if len(current) >= 2 and (current[0].lower() == fields[0].lower() or current[1] == fields[1]):
+            if current != fields or exists:
+                sys.exit("Conflicting /etc/fstab entry; nothing changed")
+            exists = True
+    mount = pathlib.Path(fields[1])
+    if mount.is_symlink() or mount.parent.is_symlink():
+        sys.exit("Refusing symlink mount point")
+    mount.mkdir(parents=True, exist_ok=True)
+    if not exists:
+        backup = str(path) + ".gcode_sync." + str(time.time_ns()) + ".bak"
+        shutil.copy2(path, backup)
+        fd, temporary = tempfile.mkstemp(prefix=".fstab-gcode_sync-", dir=path.parent)
+        try:
+            info = path.stat()
+            with os.fdopen(fd, "w") as stream:
+                os.fchown(stream.fileno(), info.st_uid, info.st_gid)
+                os.fchmod(stream.fileno(), info.st_mode & 0o7777)
+                stream.write(text + ("\n" if text and not text.endswith("\n") else "") + line + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            shutil.copystat(path, temporary)
+            os.replace(temporary, path)
+            directory = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        print("Backed up /etc/fstab to " + backup)
+'''
+
+
+def install_fstab(card, filesystem):
+    line = fstab_line(card, filesystem)
+    check_fstab(Path("/etc/fstab").read_text(), line)
+    print("\nProposed /etc/fstab entry:\n" + line)
+    print("This enables user mounting at the fixed path; users implies noexec,nosuid,nodev.")
+    if filesystem.startswith("ext"):
+        print("ext filesystems must already grant your user write access; setup does not change card ownership.")
+    if not confirm("Create the mount directory and register this entry (sudo may ask for your password)?"):
+        raise SyncError("Cancelled; no card saved and /etc/fstab unchanged.")
+    command = [sys.executable, "-c", FSTAB_HELPER]
+    if os.geteuid() != 0:
+        command.insert(0, "sudo")
+    run(command, input=json.dumps({"line": line}), text=True)
+
+
+def add_card(data, path, printer=None):
+    if not data["printers"]:
+        raise SyncError("Add a printer first with --add-printer or --setup.")
+    printer = printer or choose_id("Printer ID for this card", data["printers"])
+    key = prompt("Unique card ID (e.g. ender3-card1)")
+    if not valid_id(key) or key in data["cards"]:
+        raise SyncError("Card ID is invalid or already exists.")
+    print("Insert the card before continuing. No card will be formatted.")
+    input("Press Enter to scan available filesystems...")
+    available = devices()
+    for index, device in enumerate(available, 1):
+        kind = "removable" if device["removable"] else "FIXED DISK — take care"
+        print(f"  {index}: {device['name']} {device.get('size')} {device.get('fstype')} "
+              f"label={device.get('label') or '-'} UUID={device['uuid']} "
+              f"mounted={device.get('mountpoint') or '-'} ({kind})")
+    selection = prompt("Filesystem number for this printer card")
+    if not selection.isdigit() or not 1 <= int(selection) <= len(available):
+        raise SyncError("Invalid filesystem selection.")
+    device = available[int(selection) - 1]
+    if any(card["uuid"].lower() == device["uuid"].lower() for card in data["cards"].values()):
+        raise SyncError("This card is already assigned; use --assign-card to change its printer.")
+    if not device["removable"] and not confirm("This is not marked removable. Are you certain it is a printer card?"):
+        raise SyncError("Cancelled.")
+    card = {"printer": printer, "uuid": device["uuid"], "mount": f"/mnt/gcode_sync/{key}"}
+    install_fstab(card, device["fstype"])
+    data["cards"][key] = card
+    save_config(path, data)
+    print(f"Saved {key} -> {printer} (UUID={card['uuid']}).")
+
+
+def mounted_uuid(mount):
+    try:
+        result = subprocess.run(["findmnt", "--noheadings", "--raw", "--output", "UUID",
+                                 "--mountpoint", mount], check=False, capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        raise SyncError("Required command not found: findmnt") from exc
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise SyncError(f"Cannot inspect mount point: {mount}")
+    return result.stdout.strip()
+
+
+def rename_root_bin(mount, previous=None, expected=None):
+    binaries = [entry for entry in mount.iterdir() if entry.is_file() and not entry.is_symlink()
+                and entry.suffix.lower() == ".bin"]
+    # Only retire a file previously generated by this tool, never arbitrary firmware.
+    if len(binaries) > 1 and previous:
+        candidates = [entry for entry in binaries if entry.name != previous]
+        if len(candidates) == 1 and candidates[0].name == expected:
+            (mount / previous).unlink()
+            binaries = candidates
+    if not binaries:
+        print("No root .bin file to rename.")
+        return None
+    if len(binaries) != 1:
+        raise SyncError("Multiple root .bin files; refusing to choose firmware to rename.")
+    old = binaries[0]
+    stamp = int(time.time()) % 10000000
+    while True:
+        target = mount / f"F{stamp:07d}.BIN"
+        if target.name.lower() not in {old.name.lower(), (previous or "").lower()} and not target.exists():
+            break
+        stamp = (stamp + 1) % 10000000
+    old.rename(target)
+    print(f"Renamed {old.name} -> {target.name} (firmware may flash on next power-on).")
+    return target.name
+
+
+def sync_card(key, card, printer, args):
+    source, mount = Path(printer["source"]).resolve(), Path(card["mount"])
+    if not source.is_dir():
+        raise SyncError(f"G-code source does not exist: {source}")
+    resolved_mount = mount.resolve()
+    if source == resolved_mount or source in resolved_mount.parents or resolved_mount in source.parents:
+        raise SyncError("Source and card mount directories must not contain each other.")
+    uuid = mounted_uuid(str(mount))
+    mounted_here = uuid is None
+    if mounted_here:
+        run(["mount", str(mount)])
+    try:
+        uuid = mounted_uuid(str(mount))
+        if not uuid or uuid.lower() != card["uuid"].lower():
+            raise SyncError(f"Wrong filesystem at {mount}; expected UUID={card['uuid']}. No files copied.")
+        if not args.dry_run and not os.access(mount, os.W_OK):
+            raise SyncError(f"Card is not writable by your user: {mount}. For ext filesystems, an administrator "
+                            "must grant your user write access to the mounted filesystem, not the empty mount folder.")
+        print(f"Syncing {printer['name']} -> {key}: {source} -> {mount}", flush=True)
+        filename = printer.get("config_file", "")
+        if filename and not args.dry_run:
+            original = mount / filename
+            if original.is_file():
+                if original.is_symlink() or (source / filename).is_symlink():
+                    raise SyncError("Refusing symlink configuration backup.")
+                shutil.copy2(original, source / filename)
+            else:
+                print(f"No {filename} on card; skipping configuration backup.")
+        command = ["rsync", "-rvt", "--checksum", "--progress", "--modify-window=1"]
+        if args.delete:
+            command.append("--delete-after")
+        if args.dry_run:
+            command.append("--dry-run")
+        # Copy the folder's contents, never create another directory on the card.
+        run(command + ["--", str(source) + "/", str(mount) + "/"])
+        if args.rename_bin and not args.dry_run:
+            source_bins = [entry.name for entry in source.iterdir() if entry.is_file()
+                           and not entry.is_symlink() and entry.suffix.lower() == ".bin"]
+            renamed = rename_root_bin(mount, card.get("last_bin"), source_bins[0] if len(source_bins) == 1 else None)
+            if renamed:
+                card["last_bin"] = renamed
+    finally:
+        if mounted_here:
+            try:
+                run(["umount", str(mount)])
+            except SyncError:
+                print(f"WARNING: could not unmount {mount}; do NOT remove the card.", file=sys.stderr)
+                raise
+        else:
+            print(f"Left already-mounted card at {mount}; eject/unmount it before removal.")
+
+
+def sync_all(data, args):
+    if not data["cards"]:
+        raise SyncError("No cards configured. Run --setup or --add-card first.")
+    if args.printer and args.printer not in data["printers"]:
+        raise SyncError(f"Unknown printer: {args.printer}")
+    if args.card and args.card not in data["cards"]:
+        raise SyncError(f"Unknown card: {args.card}")
+    selected = {key: card for key, card in data["cards"].items()
+                if (not args.card or args.card == key) and (not args.printer or args.printer == card["printer"])}
+    if not selected:
+        raise SyncError("No cards match the requested printer/card.")
+    if shutil.which("rsync") is None:
+        raise SyncError("Install rsync using your distribution's package manager first.")
+    attached = devices()
+    present = [device["uuid"].lower() for device in attached]
+    failed, synced = False, 0
+    for key, card in selected.items():
+        if card["uuid"].lower() not in present:
+            print(f"Skipping {key}: card not connected (UUID={card['uuid']}).")
+            continue
+        previous_bin = card.get("last_bin")
+        try:
+            if present.count(card["uuid"].lower()) != 1:
+                raise SyncError("Multiple connected filesystems share this UUID; disconnect the clone before syncing.")
+            device = next(item for item in attached if item["uuid"].lower() == card["uuid"].lower())
+            if device.get("mountpoint") and device["mountpoint"] != card["mount"]:
+                raise SyncError(f"Card is mounted at {device['mountpoint']}; unmount it there first, then retry.")
+            sync_card(key, card, data["printers"][card["printer"]], args)
+            synced += 1
+        except (SyncError, OSError) as exc:
+            print(f"{key}: {exc}", file=sys.stderr)
+            failed = True
+        finally:
+            if card.get("last_bin") != previous_bin:
+                save_config(args.config.expanduser().resolve(), data)
+    if not synced and not failed:
+        raise SyncError("None of the selected cards are connected.")
+    return 1 if failed else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=DESCRIPTION,
+        epilog="First run: gcode_sync --setup (also starts automatically when no config is found). "
+               "Preview: gcode_sync --dry-run. Show assignments: gcode_sync --list.",
+    )
+    parser.add_argument("--config", type=Path, default=config_path(), help="profile JSON path")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--setup", action="store_true", help="guided first-time printer and card setup")
+    actions.add_argument("--add-printer", action="store_true")
+    actions.add_argument("--edit-printer", metavar="ID", help="change a printer's source folder and display name")
+    actions.add_argument("--add-card", action="store_true")
+    actions.add_argument("--assign-card", metavar="CARD", help="assign a saved card to --printer")
+    actions.add_argument("--list", action="store_true", help="show saved printers and card assignments")
+    parser.add_argument("--printer", metavar="ID", help="sync only this printer / assignment target")
+    parser.add_argument("--card", metavar="ID", help="sync only this card")
+    parser.add_argument("--delete", action="store_true", help="delete card files missing from the source")
+    parser.add_argument("--dry-run", action="store_true", help="preview copying/deletions; still mounts cards")
+    parser.add_argument("-r", "--rename-bin", action="store_true", help="rename one root .bin to a fresh 8.3 name")
+    args = parser.parse_args(argv)
+    if not sys.platform.startswith("linux"):
+        raise SyncError("This tool requires Linux (lsblk, findmnt, and /etc/fstab).")
+    if args.dry_run and (args.setup or args.add_printer or args.edit_printer or args.add_card or args.assign_card):
+        raise SyncError("--dry-run applies to syncing only, not profile or fstab changes.")
+    if os.geteuid() == 0:
+        raise SyncError("Run as your normal user, not sudo. Only fstab setup requests elevation.")
+    path = args.config.expanduser().resolve()
+    data = load_config(path)
+    if args.list:
+        print(f"Configuration: {path}")
+        for key, printer in data["printers"].items():
+            print(f"{key}: {printer['name']}\n  G-code: {printer['source']}")
+            for card_id, card in data["cards"].items():
+                if card["printer"] == key:
+                    print(f"  {card_id}: UUID={card['uuid']} at {card['mount']}")
+        return 0
+    if args.setup:
+        printer = add_printer(data, path)
+        add_card(data, path, printer)
+        while confirm("Add another card for this printer?"):
+            add_card(data, path, printer)
+    elif args.add_printer:
+        add_printer(data, path)
+    elif args.edit_printer:
+        add_printer(data, path, args.edit_printer)
+    elif args.add_card:
+        if args.printer and args.printer not in data["printers"]:
+            raise SyncError(f"Unknown printer: {args.printer}")
+        add_card(data, path, args.printer)
+    elif args.assign_card:
+        if args.assign_card not in data["cards"] or args.printer not in data["printers"]:
+            raise SyncError("Use --assign-card CARD --printer PRINTER with saved IDs.")
+        data["cards"][args.assign_card]["printer"] = args.printer
+        save_config(path, data)
+        print(f"Assigned {args.assign_card} -> {args.printer}.")
+    elif not path.exists() or not data["printers"]:
+        if args.dry_run:
+            raise SyncError("No configuration or saved printers found. Run gcode_sync --setup first; dry run changes nothing.")
+        print("No configuration or saved printers found. Starting setup; no files will be synced yet.")
+        printer = add_printer(data, path)
+        add_card(data, path, printer)
+    else:
+        return sync_all(data, args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (SyncError, OSError, ValueError, EOFError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(130)
+
